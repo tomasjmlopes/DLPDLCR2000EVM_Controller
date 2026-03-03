@@ -9,9 +9,11 @@ generate/send predefined masks at 640×360 resolution,
 and provide a stop() to display a full black mask.
 """
 import os
+import time
 import tempfile
 from typing import Optional, List
 
+import struct
 import paramiko
 from PIL import Image
 import numpy as np
@@ -63,7 +65,8 @@ class BeagleBoneImageClient:
         if not self.ssh or not self.ssh.get_transport() or not self.ssh.get_transport().is_active():
             self.ssh = paramiko.SSHClient()
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh.connect(self.host, username=self.username, password=self.password)
+            # self.ssh.connect(self.host, username=self.username, password=self.password)
+            self.ssh.connect(self.host, username=self.username, password=self.password, compress=True)
             self.sftp = self.ssh.open_sftp()
             self._warp_cursor(0, 0)
 
@@ -190,7 +193,100 @@ class BeagleBoneImageClient:
         cmd = f"export DISPLAY=:0; feh -F {remote_file} &"
         stdin, stdout, stderr = self.ssh.exec_command(cmd)
         stdout.channel.recv_exit_status()
+    
+    def send_sequence_blob(self, masks, remote_file="/home/debian/sequence.bin", flush=True):
+        self._connect()
 
+        # packed 1bpp: 640*360/8 = 28800 bytes per frame
+        frame_bytes = (self.width * self.height) // 8
+        if (self.width % 8) != 0:
+            raise ValueError("Width must be multiple of 8 for packed format")
+
+        if flush:
+            self.ssh.exec_command(f"rm -f {remote_file}")
+
+        rf = self.sftp.open(remote_file, "wb")
+        try:
+            rf.set_pipelined(True)
+
+            for i, m in enumerate(masks):
+                if m.dtype != np.uint8 or m.shape != (self.height, self.width):
+                    raise ValueError(f"Mask {i} must be uint8 with shape {(self.height, self.width)}")
+
+                bits = (m > 0).astype(np.uint8)
+                packed = np.packbits(bits, axis=1)
+                raw = packed.tobytes()
+                if len(raw) != frame_bytes:
+                    raise RuntimeError(f"Bad packed frame size: got {len(raw)}, expected {frame_bytes}")
+
+                rf.write(raw)
+
+            rf.flush()
+        finally:
+            rf.close()
+
+        return remote_file
+        
+    def play_sync_out(self, remote_file, frames, gpio_in, gpio_out, loop=1, warmup_edges=2, timeout_ms=2000, pulse_each=1):
+        self._connect()
+
+        ### Refresh display to recover the vsync pulse
+        self.start_desktop()
+        time.sleep(0.1)
+        self.stop_desktop()
+        time.sleep(0.1)
+
+        cmd = (
+            "sudo -n taskset -c 0 /home/{u}/fb_player_syncout_rt "
+            "--file {f} --frames {n} --loop {loop} "
+            "--gpio_in {gin} --gpio_out {gout} "
+            "--warmup_edges {w} --timeout_ms {t} --pulse_each {p} "
+            "--rt_prio 80 --expect_hz 120 --report_every 0"
+        ).format(
+            u=self.username,
+            f=remote_file,
+            n=int(frames),
+            loop=int(loop),
+            gin=int(gpio_in),
+            gout=int(gpio_out),
+            w=int(warmup_edges),
+            t=int(timeout_ms),
+            p=int(pulse_each),
+        )
+        stdin, stdout, stderr = self.ssh.exec_command(cmd)
+        code = stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="ignore")
+        err = stderr.read().decode(errors="ignore")
+
+        self.stop_desktop()
+        if code != 0:
+            raise RuntimeError("GPIO sync/out player failed ({}).\nSTDOUT:\n{}\nSTDERR:\n{}".format(code, out, err))
+        
+    def stop_desktop(self) -> None:
+        """
+        Stop the display manager so nothing else draws to /dev/fb0.
+        Safe and reversible. Does not affect SSH.
+        """
+        self._connect()
+        cmd = "sudo systemctl stop display-manager"
+        stdin, stdout, stderr = self.ssh.exec_command(cmd)
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            err = stderr.read().decode(errors="ignore")
+            raise RuntimeError("Failed to stop desktop:\n{}".format(err))
+
+    def start_desktop(self) -> None:
+        """
+        Restart the display manager after framebuffer experiments.
+        """
+        self._connect()
+        cmd = "sudo systemctl start display-manager"
+        stdin, stdout, stderr = self.ssh.exec_command(cmd)
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            err = stderr.read().decode(errors="ignore")
+            raise RuntimeError("Failed to start desktop:\n{}".format(err))
+    
     def close_image(self) -> None:
         """
         Kill any running feh process to close fullscreen display.
